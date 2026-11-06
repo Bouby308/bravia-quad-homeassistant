@@ -78,6 +78,46 @@ def grpc_config_entry() -> MockConfigEntry:
     )
 
 
+async def test_setup_grpc_schedules_seed_retry_on_seed_failure(
+    hass: HomeAssistant,
+    grpc_config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed setup seed must be retried in the background, not swallowed."""
+    grpc_config_entry.add_to_hass(hass)
+    mock_client = _grpc_client_mock(connect_results=[True])
+    mock_client.async_seed_notify_from_snapshot = AsyncMock(return_value=0)
+    mock_client.schedule_seed_retry = MagicMock()
+
+    with patch(
+        "custom_components.bravia_quad.grpc_refresh.BraviaGrpcClientAsync.from_keys_json",
+        return_value=mock_client,
+    ):
+        client = await async_setup_grpc_client(hass, grpc_config_entry)
+
+    assert client is mock_client
+    mock_client.schedule_seed_retry.assert_called_once()
+    assert "retrying in background" in caplog.text
+
+
+async def test_setup_grpc_no_seed_retry_on_success(
+    hass: HomeAssistant, grpc_config_entry: MockConfigEntry
+) -> None:
+    """A seeded setup starts no background retry loop."""
+    grpc_config_entry.add_to_hass(hass)
+    mock_client = _grpc_client_mock(connect_results=[True])
+    mock_client.schedule_seed_retry = MagicMock()
+
+    with patch(
+        "custom_components.bravia_quad.grpc_refresh.BraviaGrpcClientAsync.from_keys_json",
+        return_value=mock_client,
+    ):
+        client = await async_setup_grpc_client(hass, grpc_config_entry)
+
+    assert client is mock_client
+    mock_client.schedule_seed_retry.assert_not_called()
+
+
 async def test_setup_grpc_refreshes_after_auth_failure(
     hass: HomeAssistant, grpc_config_entry: MockConfigEntry
 ) -> None:
@@ -183,4 +223,103 @@ async def test_setup_grpc_skips_key_refresh_on_transport_error(
 
     mock_refresh.assert_not_awaited()
     mock_client.update_keys.assert_not_called()
+    assert mock_client.async_connect.await_count == 1
+
+
+async def test_proactive_refresh_failure_keeps_existing_keys(
+    hass: HomeAssistant,
+) -> None:
+    """A transient Sony endpoint failure must not drop entities to re-auth."""
+    from pybravia_connect import CredentialsRefreshError
+
+    from custom_components.bravia_quad.grpc_refresh import _maybe_refresh_credentials
+
+    with (
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.should_refresh_grpc_keys",
+            return_value=True,
+        ),
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.async_refresh_grpc_keys",
+            new=AsyncMock(side_effect=CredentialsRefreshError("endpoint down")),
+        ),
+    ):
+        creds, refreshed = await _maybe_refresh_credentials(
+            hass, MagicMock(data={}), TEST_KEYS, proactive=True
+        )
+
+    assert refreshed is False
+    assert creds is TEST_KEYS
+
+
+async def test_reactive_refresh_failure_raises_auth_failed(
+    hass: HomeAssistant,
+) -> None:
+    """A refresh failure on a failed connect is a real re-auth condition."""
+    from pybravia_connect import CredentialsRefreshError
+
+    from custom_components.bravia_quad.grpc_refresh import _maybe_refresh_credentials
+
+    with (
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.async_refresh_grpc_keys",
+            new=AsyncMock(side_effect=CredentialsRefreshError("endpoint down")),
+        ),
+        pytest.raises(ConfigEntryAuthFailed),
+    ):
+        await _maybe_refresh_credentials(
+            hass, MagicMock(data={}), TEST_KEYS, proactive=False
+        )
+
+
+async def test_proactive_refresh_skipped_when_keys_are_fresh(
+    hass: HomeAssistant,
+) -> None:
+    from custom_components.bravia_quad.grpc_refresh import _maybe_refresh_credentials
+
+    with (
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.should_refresh_grpc_keys",
+            return_value=False,
+        ),
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.async_refresh_grpc_keys",
+            new=AsyncMock(),
+        ) as mock_refresh,
+    ):
+        creds, refreshed = await _maybe_refresh_credentials(
+            hass, MagicMock(data={}), TEST_KEYS, proactive=True
+        )
+
+    assert refreshed is False
+    assert creds is TEST_KEYS
+    mock_refresh.assert_not_awaited()
+
+
+async def test_setup_grpc_continues_when_proactive_refresh_fails(
+    hass: HomeAssistant, grpc_config_entry: MockConfigEntry
+) -> None:
+    """Transient refresh failure at startup must still connect with old keys."""
+    from pybravia_connect import CredentialsRefreshError
+
+    grpc_config_entry.add_to_hass(hass)
+    mock_client = _grpc_client_mock(connect_results=[True])
+
+    with (
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.should_refresh_grpc_keys",
+            return_value=True,
+        ),
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.async_refresh_grpc_keys",
+            new=AsyncMock(side_effect=CredentialsRefreshError("endpoint down")),
+        ),
+        patch(
+            "custom_components.bravia_quad.grpc_refresh.BraviaGrpcClientAsync.from_keys_json",
+            return_value=mock_client,
+        ),
+    ):
+        client = await async_setup_grpc_client(hass, grpc_config_entry)
+
+    assert client is mock_client
     assert mock_client.async_connect.await_count == 1

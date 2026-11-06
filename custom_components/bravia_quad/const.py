@@ -42,6 +42,14 @@ TCP_TIMEOUT = 10
 RECONNECT_INITIAL_DELAY = 5
 RECONNECT_MAX_DELAY = 60
 
+# gRPC notify-stream watchdog. A silent stream (half-open TCP after standby or
+# a BRAVIA Connect takeover) never raises inside the library's notify worker,
+# so nothing detects it. After NOTIFY_STALL_TIMEOUT_S of no deltas, probe the
+# channel with GetCapabilities: probe OK renews just the stream; probe failure
+# renews the whole session. The probe also keeps idle TCP alive through NAT.
+NOTIFY_STALL_TIMEOUT_S = 900
+NOTIFY_HEALTH_CHECK_INTERVAL_S = 60
+
 
 # Device limits
 MAX_VOLUME = 100

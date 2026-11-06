@@ -110,6 +110,24 @@ class BraviaConnectBackend:
         self._capability_paths = frozenset(index)
         return self._capability_paths
 
+    def probe(self) -> bool:
+        """
+        Cheap channel-liveness check for the notify watchdog.
+
+        GetCapabilities is session-less (no GetSessionRandom, so it cannot race
+        the serialized session RPCs) and carries an internal 10 s timeout, so a
+        half-open TCP connection fails fast instead of blocking forever.
+        """
+        if self._lib is None:
+            self.last_rpc_error = "not connected"
+            return False
+        try:
+            self._lib.get_capabilities()
+        except (BraviaConnectionError, AuthError, OSError, ValueError) as err:
+            self.last_rpc_error = str(err)
+            return False
+        return True
+
     def get_states(self, paths: list[str] | None = None) -> dict[str, Any] | None:
         """Signed GetStates; None on failure."""
         if self._lib is None:

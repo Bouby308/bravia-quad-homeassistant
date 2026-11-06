@@ -124,9 +124,35 @@ async def _maybe_refresh_credentials(
     except CredentialsError:
         raise
     except CredentialsRefreshError as err:
+        if proactive:
+            # Transient failure (Sony endpoint / network): keep the existing
+            # keys and let the connect attempt decide. Failing setup here
+            # would drop entities to unavailable even though the session may
+            # still be perfectly usable.
+            _LOGGER.warning(
+                "Proactive Sony Seeds gRPC key refresh failed for %s; "
+                "continuing with existing keys: %s",
+                entry.data.get("host", entry.entry_id),
+                err,
+            )
+            return credentials, False
         raise ConfigEntryAuthFailed(_REFRESH_FAILED_MSG) from err
     else:
         return refreshed, True
+
+
+async def _seed_snapshot_logged(grpc_client: BraviaGrpcClientAsync, host: str) -> bool:
+    """Bulk-seed the notify cache from GetStates; log the outcome."""
+    seeded = await grpc_client.async_seed_notify_from_snapshot()
+    if seeded:
+        _LOGGER.info("gRPC GetStates snapshot seeded %d fields for %s", seeded, host)
+    else:
+        _LOGGER.warning(
+            "gRPC GetStates snapshot failed for %s (%s); retrying in background",
+            host,
+            grpc_client.last_rpc_error or "no RPC error recorded",
+        )
+    return bool(seeded)
 
 
 async def async_setup_grpc_client(
@@ -175,7 +201,15 @@ async def async_setup_grpc_client(
             )
             keys_json = credentials_to_json(credentials)
             grpc_client.update_keys(credentials)
-        except (CredentialsError, CredentialsRefreshError):
+        except (
+            CredentialsError,
+            CredentialsRefreshError,
+            ConfigEntryAuthFailed,
+            ConfigEntryNotReady,
+        ):
+            # Never propagate into the connection manager: an escaping
+            # exception killed the reconnect loop and left entities frozen
+            # at their last state with no "connection down" ever shown.
             _LOGGER.exception(
                 "Sony Seeds gRPC key refresh failed during reconnect for %s",
                 entry.data["host"],
@@ -228,16 +262,13 @@ async def async_setup_grpc_client(
         )
         grpc_client.note_external_control_ensure(ensure_result)
 
-        seeded = await grpc_client.async_seed_notify_from_snapshot()
-        if seeded:
-            _LOGGER.info(
-                "gRPC GetStates snapshot seeded %d fields for %s",
-                seeded,
-                entry.data["host"],
-            )
+        seeded = await _seed_snapshot_logged(grpc_client, entry.data["host"])
         await grpc_client.async_backfill_entity_paths()
         await grpc_client.async_start_notify()
         await grpc_client.async_warmup_notify()
+        if not seeded:
+            # _notify_stop is only cleared by async_start_notify; schedule after.
+            grpc_client.schedule_seed_retry()
         _LOGGER.info("gRPC notify stream started for %s", entry.data["host"])
     except ConfigEntryAuthFailed:
         await grpc_client.async_disconnect()

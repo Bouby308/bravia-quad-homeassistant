@@ -380,7 +380,9 @@ class BraviaGrpcMappedSelect(
             persist_notify_only_restore_state(self, self._attr_current_option)
 
 
-class BraviaGrpcMappedNumber(BraviaGrpcFeatureAvailabilityMixin, NumberEntity):
+class BraviaGrpcMappedNumber(
+    BraviaGrpcFeatureAvailabilityMixin, RestoreEntity, NumberEntity
+):
     """Int gRPC path exposed as a number."""
 
     _attr_entity_category = EntityCategory.CONFIG
@@ -418,11 +420,17 @@ class BraviaGrpcMappedNumber(BraviaGrpcFeatureAvailabilityMixin, NumberEntity):
             self._attr_mode = NumberMode.SLIDER
             self._attr_native_step = 1
             self._attr_native_unit_of_measurement = UnitOfSoundPressure.DECIBEL
-        raw = grpc_client.notify_state.get(spec.grpc_path)
-        normalized = normalize_grpc_value(
-            spec.mapping,
-            raw,
-            capability_index=grpc_client.capability_index,
+        # Key absent from the cache is not a proto3 omit-zero: no data yet.
+        # Keep the value unknown so async_added_to_hass can restore it.
+        notify_state = grpc_client.notify_state
+        normalized = (
+            normalize_grpc_value(
+                spec.mapping,
+                notify_state[spec.grpc_path],
+                capability_index=grpc_client.capability_index,
+            )
+            if spec.grpc_path in notify_state
+            else None
         )
         try:
             self._attr_native_value = (
@@ -432,8 +440,26 @@ class BraviaGrpcMappedNumber(BraviaGrpcFeatureAvailabilityMixin, NumberEntity):
             self._attr_native_value = None
 
     async def async_added_to_hass(self) -> None:
-        """Write initial state when added to Home Assistant."""
+        """Write initial state; fall back to last HA state when cache is empty."""
         await super().async_added_to_hass()
+        if self._attr_native_value is None:
+            last_state = await self.async_get_last_state()
+            if last_state is not None and last_state.state not in (
+                "unknown",
+                "unavailable",
+                "",
+            ):
+                try:
+                    native = float(last_state.state)
+                except (TypeError, ValueError):
+                    native = None
+                if (
+                    native is not None
+                    and self._attr_native_min_value
+                    <= native
+                    <= self._attr_native_max_value
+                ):
+                    self._attr_native_value = native
         self.async_write_ha_state()
 
     async def _on_grpc_state(self, value: Any) -> None:

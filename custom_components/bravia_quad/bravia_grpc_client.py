@@ -15,7 +15,13 @@ from pybravia_connect import AuthError
 from pybravia_connect import ConnectionError as BraviaConnectionError
 
 from .bravia_connect_backend import BraviaConnectBackend
-from .const import DEFAULT_GRPC_PORT, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY
+from .const import (
+    DEFAULT_GRPC_PORT,
+    NOTIFY_HEALTH_CHECK_INTERVAL_S,
+    NOTIFY_STALL_TIMEOUT_S,
+    RECONNECT_INITIAL_DELAY,
+    RECONNECT_MAX_DELAY,
+)
 from .external_control import (
     ExternalControlEnsureResult,
     async_ensure_external_control_enabled,
@@ -44,9 +50,18 @@ _DOMAIN_LOGGER = logging.getLogger("custom_components.bravia_quad")
 
 # Coalesce NoAudio/Normal bursts and give Seeds time to settle after app writes.
 _SEEDS_NO_AUDIO_DEBOUNCE_S = 2.0
-# Skip force-overwrite of paths HA just wrote (Seeds lags ~seconds behind exec).
-_SEEDS_WRITE_GUARD_S = 5.0
+# Skip force-overwrite of paths HA just wrote until the device confirms the new
+# value on the notify stream (guard entry is popped on delta); this deadline is
+# only the backstop for paths whose delta never arrives. The Seeds cloud lags
+# exec by seconds-to-minutes, so a short fixed guard let stale cloud values
+# bounce entities back (DSEE Ultimate off → on after a few seconds).
+_SEEDS_WRITE_GUARD_S = 30.0
 _PATH_NO_AUDIO = "playback_control.no_audio"
+# Cap on full session renews triggered by a failing GetStates seed. A
+# GetStates-only INVALID_ARGUMENT means the rolling session tokens went stale
+# (see _async_seed_retry_loop); a renew fixes it. If the device rejects even a
+# fresh-session seed, stop renew-churning and fall back to quiet backoff.
+_SEED_RETRY_MAX_ESCALATIONS = 3
 
 
 def _session_lost_reason(last_rpc_error: str | None) -> str:
@@ -118,6 +133,15 @@ class BraviaGrpcClientAsync:
         self._seeds_refresh_task: asyncio.Task[None] | None = None
         self._seeds_refresh_inflight: bool = False
         self._seeds_refresh_pending: bool = False
+        # Background retry loop for a GetStates seed that soft-failed. Entities
+        # are push-only, so a failed seed means stale values until the device
+        # happens to push a notify delta for each path — nothing else re-reads
+        # the bulk snapshot.
+        self._seed_retry_task: asyncio.Task[None] | None = None
+        # Full session renews this GetStates-seed failure has triggered; reset
+        # on any successful seed, capped so a hostile device cannot be
+        # reconnect-throttled.
+        self._seed_retry_escalations: int = 0
         # path → monotonic deadline; force Seeds must not overwrite until then.
         self._seeds_write_guard: dict[str, float] = {}
         self._feature_unavailable_reasons: dict[str, str] = {}
@@ -127,6 +151,12 @@ class BraviaGrpcClientAsync:
         self._persist_feature_reasons_task: asyncio.Task[None] | None = None
         self._notify_restore_event = asyncio.Event()
         self._light_reconnect_event = asyncio.Event()
+        # Stall watchdog decided the transport is alive but the stream is dead:
+        # restart the notify stream without re-auth / unavailability.
+        self._stream_renew_pending = False
+        # Suppress availability callbacks during a session renew so entities
+        # keep their last state until the renew outcome is known.
+        self._availability_suppressed = False
 
     def configure_feature_unavailable_persistence(
         self,
@@ -216,6 +246,8 @@ class BraviaGrpcClientAsync:
 
     def _notify_availability(self, *, available: bool) -> None:
         """Notify entities when the gRPC session connects or drops."""
+        if self._availability_suppressed:
+            return
         for callback in tuple(self._availability_callbacks):
             try:
                 callback(available)
@@ -395,6 +427,13 @@ class BraviaGrpcClientAsync:
         if task is not None and not task.done():
             task.cancel()
 
+    def _cancel_seed_retry(self) -> None:
+        """Cancel a pending background GetStates seed retry."""
+        task = self._seed_retry_task
+        self._seed_retry_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     def _seeds_guarded_paths(self) -> frozenset[str]:
         """Paths HA wrote recently; exclude from force Seeds overwrite."""
         now = time.monotonic()
@@ -467,6 +506,7 @@ class BraviaGrpcClientAsync:
         self._notify_restore_event.set()
         self._light_reconnect_event.set()
         self._cancel_seeds_refresh()
+        self._cancel_seed_retry()
         if self._notify_task and not self._notify_task.done():
             await asyncio.to_thread(self._client.stop_notify)
             await asyncio.to_thread(self._client.close)
@@ -526,8 +566,19 @@ class BraviaGrpcClientAsync:
         async with self._session_lock:
             snapshot = await asyncio.to_thread(self._client.get_states)
         if not snapshot:
-            _LOGGER.warning("gRPC GetStates snapshot failed for %s", self.host)
+            # Debug, not warning: the background retry loop calls this every
+            # backoff tick, so a warning here spams the HA log while a seed
+            # failure persists. Every failure site (setup, session restore,
+            # light reconnect, retry escalation) logs its own warning instead.
+            # Raw last_rpc_error, not _session_lost_reason: that helper's
+            # no-error fallback text is notify-stream specific.
+            self._debug(
+                "gRPC GetStates snapshot failed for %s (%s)",
+                self.host,
+                self.last_rpc_error or "no RPC error recorded",
+            )
             return 0
+        self._seed_retry_escalations = 0
         self._client.update_notify_cache(snapshot)
         restored = self._client.apply_persisted_feature_unavailable_reasons(
             self._feature_unavailable_reasons
@@ -543,6 +594,98 @@ class BraviaGrpcClientAsync:
             "GetStates snapshot seeded %d fields on %s", len(snapshot), self.host
         )
         return len(snapshot)
+
+    def schedule_seed_retry(self) -> None:
+        """Retry a soft-failed GetStates seed in the background (idempotent)."""
+        if self._notify_stop.is_set() or not self._connected:
+            return
+        task = self._seed_retry_task
+        if task is not None and not task.done():
+            return
+        self._seed_retry_task = asyncio.create_task(self._async_seed_retry_loop())
+
+    async def _async_seed_retry_loop(self) -> None:
+        """
+        Re-attempt a failed GetStates seed; renew the session when stale-auth.
+
+        Entities are push-only, so without this a failed seed leaves them at
+        stale cache values until the device happens to push a delta for each
+        path (static settings may never push).
+
+        GetStatesWithAuth is signed with rolling session tokens learned from
+        the *previous* GetStates response (pybravia-connect refreshes
+        session_random/auth_token from each response body). When that rolling
+        state desyncs, the device rejects every later GetStates with a
+        deterministic INVALID_ARGUMENT while notify and exec keep working —
+        same-session retries can never recover, only a renew (fresh
+        GetSessionRandom via a full reconnect) can. So an INVALID_ARGUMENT
+        failure escalates through ``_notify_restore_event``: the notify bridge
+        exits, the connection manager renews the session and re-seeds, and a
+        failed renew seed reschedules this loop. The escalation count is capped
+        (_SEED_RETRY_MAX_ESCALATIONS, reset on any successful seed) so a device
+        that rejects even a fresh-session seed gets quiet backoff retries
+        instead of endless renew churn.
+        """
+        delay = RECONNECT_INITIAL_DELAY
+        try:
+            while not self._notify_stop.is_set() and self._connected:
+                await self._async_wait(delay)
+                if self._notify_stop.is_set():
+                    return
+                if not self._connected:
+                    # Session died; the connection manager owns recovery now
+                    # (_async_restore_session re-seeds and reschedules itself).
+                    return
+                try:
+                    seeded = await self.async_seed_notify_from_snapshot()
+                    if seeded:
+                        await self.async_backfill_entity_paths()
+                        self._dispatch_snapshot_callbacks()
+                        _LOGGER.info(
+                            "gRPC GetStates seed recovered on %s after retry "
+                            "(%d fields)",
+                            self.host,
+                            seeded,
+                        )
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A raise must not kill the retry task: no retry means no
+                    # recovery of entity state, same as a dead manager.
+                    _LOGGER.exception(
+                        "gRPC GetStates seed retry failed for %s", self.host
+                    )
+                rpc_error = self.last_rpc_error or ""
+                if (
+                    "INVALID_ARGUMENT" in rpc_error
+                    and self._seed_retry_escalations < _SEED_RETRY_MAX_ESCALATIONS
+                ):
+                    self._seed_retry_escalations += 1
+                    _LOGGER.warning(
+                        "gRPC GetStates rejected on %s (%s); renewing session "
+                        "to recover the seed (renew %d/%d)",
+                        self.host,
+                        rpc_error,
+                        self._seed_retry_escalations,
+                        _SEED_RETRY_MAX_ESCALATIONS,
+                    )
+                    # Serialize through the connection manager: the bridge
+                    # exits on this event, _async_renew_after_loss renews with
+                    # a fresh GetSessionRandom and re-seeds.
+                    self._notify_restore_event.set()
+                    return
+                self._debug(
+                    "GetStates seed retry failed on %s (%s); next attempt in %ds",
+                    self.host,
+                    rpc_error or "no RPC error recorded",
+                    delay,
+                )
+                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+        finally:
+            # Identity guard: never clear a slot already holding a newer task.
+            if self._seed_retry_task is asyncio.current_task():
+                self._seed_retry_task = None
 
     def _sync_feature_unavailable_reasons_from_cache(self) -> None:
         """Persist export of real reasons from notify_state (debounced)."""
@@ -748,6 +891,16 @@ class BraviaGrpcClientAsync:
                 bool_value=bool_value,
             )
 
+        # Same precedence as BraviaConnectBackend.exec_command.
+        if bool_value is not None:
+            exec_payload: Any = bool_value
+        elif int_value is not None:
+            exec_payload = int_value
+        elif string_value is not None:
+            exec_payload = string_value
+        else:
+            exec_payload = value
+
         self._debug(
             "ExecCommand %s value=%s string=%s int=%s bool=%s",
             command_path,
@@ -761,18 +914,7 @@ class BraviaGrpcClientAsync:
         # via external-control enable; asyncio.Lock is not reentrant -> deadlock).
         async with self._session_lock:
             ok = await asyncio.to_thread(_run)
-        if ok:
-            self._debug("ExecCommand %s -> True", command_path)
-            # Trust exec cache for HA writes. Immediate Seeds force-refresh was
-            # reverting entities: cloud lags (~seconds) and _sync_from_notify
-            # after turn_on/off read the stale value. no_audio refresh picks up
-            # app-side changes; guard the written path so that refresh cannot
-            # stomp this write while Seeds catches up.
-            if command_path in SEEDS_SEED_PATHS:
-                self._seeds_write_guard[command_path] = (
-                    time.monotonic() + _SEEDS_WRITE_GUARD_S
-                )
-        else:
+        if not ok:
             context = self._exec_failure_context(command_path)
             _LOGGER.warning(
                 "ExecCommand %s failed (session may be stale): %s",
@@ -788,13 +930,49 @@ class BraviaGrpcClientAsync:
                     ok = await asyncio.to_thread(_run)
                 if ok:
                     self._debug("ExecCommand %s -> True after restore", command_path)
+                    self._apply_exec_write(command_path, exec_payload)
                 else:
                     _LOGGER.warning(
                         "ExecCommand %s failed after session restore: %s",
                         command_path,
                         self._exec_failure_context(command_path),
                     )
+        else:
+            self._debug("ExecCommand %s -> True", command_path)
+            self._apply_exec_write(command_path, exec_payload)
+        if ok:
+            await self._async_confirm_exec_readback(command_path)
         return ok
+
+    def _apply_exec_write(self, command_path: str, payload: Any) -> None:
+        """Trust HA's own exec: merge the written value + guard it from Seeds."""
+        # Exec never echoes into notify_state; without this merge, entity
+        # _sync_from_notify() (and any _dispatch_snapshot_callbacks() from a
+        # concurrent Seeds refresh or light reconnect) writes the pre-write
+        # cache value straight back to HA (DSEE off -> on bounce).
+        if payload is not None:
+            self._client.update_notify_cache({command_path: payload})
+        # Guard the written path so a force Seeds refresh cannot stomp it while
+        # the cloud catches up; released early by the device's own notify delta.
+        if command_path in SEEDS_SEED_PATHS:
+            self._seeds_write_guard[command_path] = (
+                time.monotonic() + _SEEDS_WRITE_GUARD_S
+            )
+
+    async def _async_confirm_exec_readback(self, command_path: str) -> None:
+        """
+        Re-read an exec'd path from the device and merge the truth into the cache.
+
+        Notify-only paths are skipped (the device rejects single-path GetStates
+        for them); failures are soft — the optimistic value simply stands.
+        """
+        if command_path in NOTIFY_ONLY_GRPC_PATHS or not self._connected:
+            return
+        confirmed = await self.async_get_states_single_path(command_path)
+        if confirmed is None:
+            return
+        self._client.update_notify_cache({command_path: confirmed})
+        self._debug("ExecCommand %s read back device value %r", command_path, confirmed)
 
     async def async_exec_denormalized(
         self,
@@ -838,6 +1016,7 @@ class BraviaGrpcClientAsync:
         self._notify_restore_event.set()
         self._light_reconnect_event.set()
         self._cancel_seeds_refresh()
+        self._cancel_seed_retry()
         await asyncio.to_thread(self._client.stop_notify)
         if self._notify_task:
             self._notify_task.cancel()
@@ -864,27 +1043,48 @@ class BraviaGrpcClientAsync:
                         delay = min(delay * 2, RECONNECT_MAX_DELAY)
                         continue
 
-                await self._run_notify_bridge()
+                try:
+                    await self._run_notify_bridge()
 
-                if self._notify_stop.is_set():
-                    break
+                    if self._notify_stop.is_set():
+                        break
 
-                self._set_connected(connected=False)
-                await asyncio.to_thread(self._client.stop_notify)
-                await asyncio.to_thread(self._client.close)
-                self._debug(
-                    "Notify connection lost on %s; reconnect scheduled in %ds",
-                    self.host,
-                    delay,
-                )
-                _LOGGER.warning(
-                    "gRPC session lost on %s (%s); reconnect in %ds",
-                    self.host,
-                    _session_lost_reason(self.last_rpc_error),
-                    delay,
-                )
-                await self._async_wait(delay)
-                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                    if self._stream_renew_pending:
+                        # Watchdog: transport alive, stream silent. Restart the
+                        # notify stream on the live session; entities never leave
+                        # their last state.
+                        self._stream_renew_pending = False
+                        await asyncio.to_thread(self._client.stop_notify)
+                        self._debug(
+                            "Notify stream renewed on %s; re-seeding", self.host
+                        )
+                        await self._async_light_reconnect()
+                        continue
+
+                    if await self._async_renew_after_loss():
+                        delay = RECONNECT_INITIAL_DELAY
+                        continue
+
+                    _LOGGER.warning(
+                        "gRPC renew to %s failed; retry in %ds",
+                        self.host,
+                        delay,
+                    )
+                    await self._async_wait(delay)
+                    delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A failed renew must never kill this task (a dead manager
+                    # means no recovery and no "connection down" ever again).
+                    _LOGGER.exception(
+                        "gRPC connection manager iteration failed for %s", self.host
+                    )
+                    await asyncio.to_thread(self._client.stop_notify)
+                    await asyncio.to_thread(self._client.close)
+                    self._set_connected(connected=False)
+                    await self._async_wait(delay)
+                    delay = min(delay * 2, RECONNECT_MAX_DELAY)
         except asyncio.CancelledError:
             self._notify_stop.set()
             await asyncio.to_thread(self._client.stop_notify)
@@ -892,12 +1092,40 @@ class BraviaGrpcClientAsync:
             _LOGGER.debug("gRPC connection manager cancelled for %s", self.host)
             raise
 
+    async def _async_renew_after_loss(self) -> bool:
+        """
+        Tear down the lost connection and renew the session; True when renewed.
+
+        Availability stays frozen at its current value during the attempt so
+        entities keep showing their last state; unavailable is published only
+        when the renewal itself fails.
+        """
+        await asyncio.to_thread(self._client.stop_notify)
+        await asyncio.to_thread(self._client.close)
+        self._debug("Notify connection lost on %s; renewing session", self.host)
+        _LOGGER.warning(
+            "gRPC session lost on %s (%s); renewing",
+            self.host,
+            _session_lost_reason(self.last_rpc_error),
+        )
+        self._availability_suppressed = True
+        try:
+            renewed = await self._async_restore_session()
+        finally:
+            self._availability_suppressed = False
+        self._notify_availability(available=self._connected)
+        return renewed
+
     async def _async_wait(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._notify_stop.wait(), timeout=seconds)
 
     async def _async_restore_session(self) -> bool:
         """Reconnect, authenticate, snapshot seed, and refresh entity callbacks."""
+        # This path seeds synchronously and reschedules on failure; a sleeping
+        # background retry is stale from here on (and would reset nobody's
+        # backoff — this restore already starts from a fresh connection).
+        self._cancel_seed_retry()
         await asyncio.to_thread(self._client.stop_notify)
         await asyncio.to_thread(self._client.close)
         if not await self.async_connect():
@@ -905,7 +1133,15 @@ class BraviaGrpcClientAsync:
             if self.is_transport_error:
                 return False
             if self._refresh_keys_callback is not None:
-                refreshed = await self._refresh_keys_callback()
+                try:
+                    refreshed = await self._refresh_keys_callback()
+                except Exception:
+                    # ConfigEntryAuthFailed etc. must not propagate: an
+                    # exception here used to kill the connection manager.
+                    _LOGGER.exception(
+                        "gRPC session-key refresh failed for %s", self.host
+                    )
+                    return False
                 if refreshed and await self.async_connect():
                     pass
                 else:
@@ -929,8 +1165,12 @@ class BraviaGrpcClientAsync:
             )
         else:
             _LOGGER.warning(
-                "gRPC reconnected to %s but GetStates seed failed", self.host
+                "gRPC reconnected to %s but GetStates seed failed (%s); "
+                "retrying in background",
+                self.host,
+                self.last_rpc_error or "no RPC error recorded",
             )
+            self.schedule_seed_retry()
         await self.async_backfill_entity_paths()
         self._dispatch_snapshot_callbacks()
         if self._reconnect_callback is not None:
@@ -944,6 +1184,9 @@ class BraviaGrpcClientAsync:
         """Stream recovered without full auth loss: re-seed and refresh entities."""
         if self._notify_stop.is_set() or not self._connected:
             return
+        # Seeding synchronously here; a sleeping background retry would race
+        # this attempt and carry a stale backoff.
+        self._cancel_seed_retry()
         seeded = await self.async_seed_notify_from_snapshot()
         if seeded:
             self._debug(
@@ -951,8 +1194,19 @@ class BraviaGrpcClientAsync:
                 self.host,
                 seeded,
             )
+        else:
+            _LOGGER.warning(
+                "gRPC stream recovered on %s but GetStates re-seed failed (%s); "
+                "retrying in background",
+                self.host,
+                self.last_rpc_error or "no RPC error recorded",
+            )
         await self.async_backfill_entity_paths()
+        # Replay the cache either way: entities keep the freshest known values
+        # now, and the background retry (if any) re-dispatches once re-seeded.
         self._dispatch_snapshot_callbacks()
+        if not seeded:
+            self.schedule_seed_retry()
 
     def _dispatch_snapshot_callbacks(self) -> None:
         """Push cached notify_state to registered callbacks (post-reconnect refresh)."""
@@ -983,6 +1237,9 @@ class BraviaGrpcClientAsync:
                 if self._notify_stop.is_set():
                     return
                 self._last_notify_at = time.monotonic()
+                # Device confirmed the value on the stream; a stale Seeds cloud
+                # value must no longer be allowed to overwrite it.
+                self._seeds_write_guard.pop(path, None)
                 self._debug("Notify delta %s=%r", path, value)
                 if path == _PATH_NO_AUDIO:
                     self.schedule_seeds_refresh()
@@ -1008,6 +1265,8 @@ class BraviaGrpcClientAsync:
             on_connection_lost,
             on_reconnect,
         )
+        # Fresh stream: full stall grace window before the first probe.
+        self._last_notify_at = time.monotonic()
 
         while not self._notify_stop.is_set():
             restore_waiter = asyncio.create_task(self._notify_restore_event.wait())
@@ -1016,6 +1275,7 @@ class BraviaGrpcClientAsync:
             done, pending = await asyncio.wait(
                 {restore_waiter, light_waiter, stop_waiter},
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=NOTIFY_HEALTH_CHECK_INTERVAL_S,
             )
             for task in pending:
                 task.cancel()
@@ -1031,6 +1291,46 @@ class BraviaGrpcClientAsync:
             if light_waiter in done:
                 self._light_reconnect_event.clear()
                 await self._async_light_reconnect()
+            if await self._async_check_stream_health():
+                return
+
+    async def _async_check_stream_health(self) -> bool:
+        """
+        Notify-stall watchdog tick; True means the bridge must exit for renew.
+
+        The library's notify worker only reports connection loss on stream
+        *exceptions*; a half-open TCP connection blocks forever with no deltas
+        and no error. After ``NOTIFY_STALL_TIMEOUT_S`` of silence, probe the
+        channel with the session-less GetCapabilities RPC: probe OK renews only
+        the stream, probe failure lets the connection manager renew the whole
+        session (with key-refresh fallback).
+        """
+        if self._last_notify_at is None:
+            self._last_notify_at = time.monotonic()
+            return False
+        now = time.monotonic()
+        if now - self._last_notify_at < NOTIFY_STALL_TIMEOUT_S:
+            return False
+        # Reset first so a slow probe cannot retrigger on the next tick.
+        self._last_notify_at = now
+        probe_ok = await asyncio.to_thread(self._client.probe)
+        if probe_ok:
+            _LOGGER.info(
+                "gRPC notify silent on %s for %ds but GetCapabilities OK; "
+                "restarting notify stream",
+                self.host,
+                NOTIFY_STALL_TIMEOUT_S,
+            )
+            self._stream_renew_pending = True
+        else:
+            _LOGGER.warning(
+                "gRPC notify silent on %s for %ds and health probe failed (%s); "
+                "renewing session",
+                self.host,
+                NOTIFY_STALL_TIMEOUT_S,
+                _session_lost_reason(self.last_rpc_error),
+            )
+        return True
 
     async def async_iter_notifications(self) -> AsyncIterator[NotifyStateUpdate]:
         """Async iterator over state notifications (for scripts/tests)."""

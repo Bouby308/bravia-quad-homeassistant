@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.media_player import (
+    ATTR_INPUT_SOURCE,
+    ATTR_MEDIA_VOLUME_LEVEL,
+    ATTR_MEDIA_VOLUME_MUTED,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
 )
+from homeassistant.core import HomeAssistant
 from pybravia_connect import CapabilityMeta
 
 from custom_components.bravia_quad.const import (
@@ -872,3 +877,84 @@ async def test_power_commands_rate_limited_to_once_per_interval(
 
     assert grpc_client.async_exec_denormalized.await_count == 3
     assert _POWER_COMMAND_MIN_INTERVAL_S == 5.0
+
+
+async def _restore_last_state_harness(
+    hass: object,
+    grpc_client: MagicMock,
+    entry: MagicMock,
+    *,
+    last_state: str,
+    attributes: dict[str, object] | None = None,
+    cache: dict[str, object] | None = None,
+) -> BraviaGrpcMediaPlayer:
+    from homeassistant.core import State
+    from homeassistant.helpers.restore_state import StoredState, async_get
+
+    if cache is not None:
+        grpc_client.notify_state = cache
+    entity = BraviaGrpcMediaPlayer(grpc_client, entry)
+    entity.entity_id = "media_player.quad"
+    entity.hass = hass  # type: ignore[assignment]
+    entity.async_write_ha_state = MagicMock()
+    async_get(hass).last_states[entity.entity_id] = StoredState(  # type: ignore[arg-type]
+        State(entity.entity_id, last_state, attributes or {}),
+        None,
+        datetime.now(tz=UTC),
+    )
+    await entity.async_added_to_hass()
+    return entity
+
+
+@pytest.mark.asyncio
+async def test_added_restores_last_state_when_device_silent(
+    hass: HomeAssistant, grpc_client: MagicMock, entry: MagicMock
+) -> None:
+    """HA startup with no device data keeps the last known state on screen."""
+    entity = await _restore_last_state_harness(
+        hass,
+        grpc_client,
+        entry,
+        last_state="playing",
+        attributes={
+            ATTR_INPUT_SOURCE: "spotify",
+            ATTR_MEDIA_VOLUME_LEVEL: 0.5,
+            ATTR_MEDIA_VOLUME_MUTED: True,
+        },
+        cache={},
+    )
+
+    assert entity._attr_state == MediaPlayerState.PLAYING
+    assert entity._attr_source == "spotify"
+    assert entity._attr_volume_level == 0.5
+    assert entity._attr_is_volume_muted is True
+
+
+@pytest.mark.asyncio
+async def test_added_cache_beats_restored_state(
+    hass: HomeAssistant, grpc_client: MagicMock, entry: MagicMock
+) -> None:
+    """Any real device value wins over the restored state."""
+    entity = await _restore_last_state_harness(
+        hass,
+        grpc_client,
+        entry,
+        last_state="playing",
+        attributes={ATTR_INPUT_SOURCE: "spotify"},
+        cache={"power": "off", _PATH_INPUT: "bluetooth"},
+    )
+
+    assert entity._attr_state == MediaPlayerState.OFF
+    assert entity._attr_source != "spotify"
+
+
+@pytest.mark.asyncio
+async def test_added_invalid_restored_state_ignored(
+    hass: HomeAssistant, grpc_client: MagicMock, entry: MagicMock
+) -> None:
+    entity = await _restore_last_state_harness(
+        hass, grpc_client, entry, last_state="unavailable", cache={}
+    )
+
+    # Falls back to the plain cache default instead of a bogus restored state.
+    assert entity._attr_state == MediaPlayerState.OFF

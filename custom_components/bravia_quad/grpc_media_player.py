@@ -10,12 +10,18 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.media_player import (
+    ATTR_INPUT_SOURCE,
+    ATTR_INPUT_SOURCE_LIST,
+    ATTR_MEDIA_VOLUME_LEVEL,
+    ATTR_MEDIA_VOLUME_MUTED,
+    ATTR_SOUND_MODE,
     MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
 )
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 from pybravia_connect import enum_values_from_capability
 
@@ -342,7 +348,7 @@ def _availability_allows_action(availability: Any, action: str) -> bool:
 
 
 class BraviaGrpcMediaPlayer(
-    BraviaGrpcPathMixin, VolumeTransitionMixin, MediaPlayerEntity
+    BraviaGrpcPathMixin, RestoreEntity, VolumeTransitionMixin, MediaPlayerEntity
 ):
     """Bravia Quad media player driven by gRPC notify + ExecCommand."""
 
@@ -946,5 +952,38 @@ class BraviaGrpcMediaPlayer(
         self.async_on_remove(_cancel_position_write)
         await self._grpc_client.async_fetch_field_paths(list(_PLAYBACK_BACKFILL_PATHS))
         self._seed_from_cache()
+        # HA startup with no device data yet: keep the last known state visible
+        # instead of defaulting to off/unknown; real cache values and any notify
+        # delta take over as soon as they arrive.
+        if self._grpc_client.notify_state.get(_PATH_POWER) is None:
+            await self._async_restore_last_player_state()
         self._invalidate_media_cached_properties()
         self.async_write_ha_state()
+
+    async def _async_restore_last_player_state(self) -> None:
+        """Apply the last saved HA state while the device has not reported in."""
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in ("", "unknown", "unavailable"):
+            return
+        try:
+            self._attr_state = MediaPlayerState(last_state.state)
+        except ValueError:
+            return
+        attrs = last_state.attributes or {}
+        source = attrs.get(ATTR_INPUT_SOURCE)
+        if isinstance(source, str) and source:
+            self._attr_source = source
+        source_list = attrs.get(ATTR_INPUT_SOURCE_LIST)
+        if isinstance(source_list, list) and source_list:
+            self._attr_source_list = [
+                item for item in source_list if isinstance(item, str)
+            ]
+        volume = attrs.get(ATTR_MEDIA_VOLUME_LEVEL)
+        if isinstance(volume, int | float):
+            self._attr_volume_level = float(volume)
+        muted = attrs.get(ATTR_MEDIA_VOLUME_MUTED)
+        if isinstance(muted, bool):
+            self._attr_is_volume_muted = muted
+        sound_mode = attrs.get(ATTR_SOUND_MODE)
+        if isinstance(sound_mode, str) and sound_mode:
+            self._attr_sound_mode = sound_mode

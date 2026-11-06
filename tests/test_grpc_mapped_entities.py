@@ -23,6 +23,7 @@ from custom_components.bravia_quad.grpc_entity_registry import (
 from custom_components.bravia_quad.grpc_mapped_entities import (
     BraviaGrpcBassLevelSelect,
     BraviaGrpcFeatureAvailabilitySensor,
+    BraviaGrpcMappedNumber,
     BraviaGrpcMappedSelect,
     BraviaGrpcMappedSwitch,
     mapped_feature_unavailable_reason,
@@ -872,3 +873,77 @@ def test_mapped_feature_unavailable_reason_helper() -> None:
         )
         == "unavailable"
     )
+
+
+@pytest.mark.asyncio
+async def test_mapped_number_restores_on_added(
+    hass: HomeAssistant, grpc_client: MagicMock, grpc_entry: MagicMock
+) -> None:
+    """Startup with an empty notify cache keeps the last known number value."""
+    spec = entity_spec_for_path("sound_setting.volume.subwoofer")
+    assert spec is not None
+    entity = BraviaGrpcMappedNumber(
+        grpc_client, grpc_entry, spec, native_min_value=0.0, native_max_value=12.0
+    )
+    entity.entity_id = f"number.{DOMAIN}_serial123_subwoofer"
+    entity.hass = hass
+    entity.async_write_ha_state = MagicMock()
+
+    async_get(hass).last_states[entity.entity_id] = StoredState(
+        State(entity.entity_id, "7"),
+        None,
+        datetime.now(tz=UTC),
+    )
+
+    await entity.async_added_to_hass()
+
+    assert entity._attr_native_value == 7.0
+
+
+@pytest.mark.asyncio
+async def test_mapped_number_out_of_range_restore_ignored(
+    hass: HomeAssistant, grpc_client: MagicMock, grpc_entry: MagicMock
+) -> None:
+    spec = entity_spec_for_path("sound_setting.volume.subwoofer")
+    assert spec is not None
+    entity = BraviaGrpcMappedNumber(
+        grpc_client, grpc_entry, spec, native_min_value=0.0, native_max_value=12.0
+    )
+    entity.entity_id = f"number.{DOMAIN}_serial123_subwoofer"
+    entity.hass = hass
+    entity.async_write_ha_state = MagicMock()
+
+    async_get(hass).last_states[entity.entity_id] = StoredState(
+        State(entity.entity_id, "99"),
+        None,
+        datetime.now(tz=UTC),
+    )
+
+    await entity.async_added_to_hass()
+
+    assert entity._attr_native_value is None
+
+
+@pytest.mark.asyncio
+async def test_mapped_number_cache_beats_restored_state(
+    hass: HomeAssistant, grpc_client: MagicMock, grpc_entry: MagicMock
+) -> None:
+    spec = entity_spec_for_path("sound_setting.volume.subwoofer")
+    assert spec is not None
+    grpc_client.notify_state = {"sound_setting.volume.subwoofer": 3}
+    entity = BraviaGrpcMappedNumber(
+        grpc_client, grpc_entry, spec, native_min_value=0.0, native_max_value=12.0
+    )
+    entity.entity_id = f"number.{DOMAIN}_serial123_subwoofer"
+    entity.hass = hass
+    entity.async_write_ha_state = MagicMock()
+
+    async_get(hass).last_states[entity.entity_id] = StoredState(
+        State(entity.entity_id, "7"),
+        None,
+        datetime.now(tz=UTC),
+    )
+
+    await entity.async_added_to_hass()
+
+    assert entity._attr_native_value == 3.0
